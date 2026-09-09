@@ -9,7 +9,7 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 from cvzone.FaceMeshModule import FaceMeshDetector
 from ultralytics import YOLO
 
-# --- RESPONSIVE CSS ---
+# --- CSS for responsive UI (same as before) ---
 st.set_page_config(page_title="Smart Study Monitor", layout="wide", page_icon="📚")
 st.markdown("""
 <style>
