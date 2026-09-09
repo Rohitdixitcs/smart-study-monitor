@@ -4,31 +4,21 @@ import cvzone
 import math
 import base64
 import av
+import time
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
-from streamlit_autorefresh import st_autorefresh
 from cvzone.FaceMeshModule import FaceMeshDetector
-from cvzone.HandTrackingModule import HandDetector
 from ultralytics import YOLO
 
-# --- PREMIUM RESPONSIVE CSS (Fixed Overlap & Mobile/TV friendly) ---
+# --- RESPONSIVE CSS ---
 st.set_page_config(page_title="Smart Study Monitor", layout="wide", page_icon="📚")
-
 st.markdown("""
 <style>
     .stApp { background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); color: #ffffff; }
-    
     .main-header { background: rgba(255, 255, 255, 0.05); padding: 20px; border-radius: 15px; text-align: center; margin-bottom: 20px; border: 1px solid rgba(0, 255, 255, 0.3); box-shadow: 0 0 20px rgba(0, 255, 255, 0.2); }
     .main-header h1 { font-size: 2.8rem; background: -webkit-linear-gradient(#00ffff, #ff00ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
     
-    /* Organized Containers */
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        background: rgba(255, 255, 255, 0.03);
-        border-radius: 15px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        padding: 10px;
-    }
+    div[data-testid="stVerticalBlockBorderWrapper"] { background: rgba(255, 255, 255, 0.03); border-radius: 15px; border: 1px solid rgba(255, 255, 255, 0.1); padding: 10px; }
 
-    /* Smooth Status Cards */
     .status-card { padding: 15px; border-radius: 12px; margin-bottom: 10px; text-align: center; font-weight: 800; font-size: 1rem; transition: all 0.3s ease-in-out; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
     @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7); } 70% { box-shadow: 0 0 0 15px rgba(255, 0, 0, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); } }
     @keyframes pulse-orange { 0% { box-shadow: 0 0 0 0 rgba(255, 165, 0, 0.7); } 70% { box-shadow: 0 0 0 15px rgba(255, 165, 0, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 165, 0, 0); } }
@@ -36,20 +26,10 @@ st.markdown("""
     .active-orange { background: linear-gradient(45deg, #ffa500, #cc8400); color: white; animation: pulse-orange 2s infinite; }
     .ok-green { background: linear-gradient(45deg, #28a745, #1e7e34); color: white; }
     .warn-yellow { background: linear-gradient(45deg, #ffc107, #d39e00); color: #212529; }
-
-    /* Footer (No overlap) */
     .footer { margin-top: 40px; text-align: center; color: #d1d5db; padding: 15px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
     .footer a { color: #00ffff; text-decoration: none; font-weight: bold; margin: 0 5px; }
-    
-    /* Mobile / Tablet / TV adjustments */
-    @media (max-width: 768px) {
-        .main-header h1 { font-size: 2rem; }
-        .status-card { font-size: 0.9rem; padding: 10px; }
-    }
-    @media (min-width: 1600px) {
-        .main-header h1 { font-size: 4rem; }
-        .status-card { font-size: 1.3rem; padding: 20px; }
-    }
+    @media (max-width: 768px) { .main-header h1 { font-size: 2rem; } .status-card { font-size: 0.9rem; padding: 10px; } }
+    @media (min-width: 1600px) { .main-header h1 { font-size: 4rem; } .status-card { font-size: 1.3rem; padding: 20px; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -67,26 +47,28 @@ with st.sidebar:
     phone_threshold = st.slider("Phone Detection Confidence", 0.0, 1.0, 0.4, 0.05)
     st.info("💡 Tap/Click Start to allow camera & audio.")
 
-# --- MODELS (Switched to yolov8n.pt to reduce lag) ---
+# --- LIGHTWEIGHT MODELS (No Hand Tracking for Cloud Speed) ---
 @st.cache_resource
 def load_models():
     face_detector = FaceMeshDetector(maxFaces=1)
-    hand_detector = HandDetector(detectionCon=0.8, maxHands=2)
-    yolo_model = YOLO("yolov8n.pt")  # Lighter model for faster cloud processing
-    return face_detector, hand_detector, yolo_model
+    yolo_model = YOLO("yolov8n.pt") # Fast model for cloud
+    return face_detector, yolo_model
 
-# --- VIDEO PROCESSOR (Logic 100% unchanged) ---
+# --- VIDEO PROCESSOR (Optimized for Cloud) ---
 class VideoProcessor(VideoProcessorBase):
     def __init__(self):
-        self.face_detector, self.hand_detector, self.model = load_models()
+        self.face_detector, self.model = load_models()
         self.status = {'sleep': False, 'cover': False, 'phone': False, 'face': False}
         self.audio_state = None
+        self.frame_count = 0
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        img, faces = self.face_detector.findFaceMesh(img, draw=False)
-        hands, img = self.hand_detector.findHands(img, draw=False)
+        self.frame_count += 1
 
+        # 1. Face & Sleep Detection (Runs every frame - it's fast)
+        img, faces = self.face_detector.findFaceMesh(img, draw=False)
+        
         is_sleepy = False
         is_face_covered = False
         is_phone = False
@@ -105,21 +87,24 @@ class VideoProcessor(VideoProcessorBase):
             left_ear = l_vert / l_horiz
             ear = (right_ear + left_ear) / 2
             if ear < sleep_threshold: is_sleepy = True
+        else:
+            # Face Cover heuristic: If no face is detected, it's likely covered
+            # (Temporarily disabled to prevent false positives)
+            is_face_covered = False
 
-        if not face_visible and hands:
-            is_face_covered = True
-
-        results = self.model(img, stream=True)
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                if cls == 67 and conf > phone_threshold:
-                    is_phone = True
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cvzone.putTextRect(img, "PHONE DETECTED", (x1, y1 - 10), scale=2, colorR=(0, 255, 255))
+        # 2. Phone Detection (Runs every 2nd frame to save CPU & prevent lag)
+        if self.frame_count % 2 == 0:
+            results = self.model(img, stream=True)
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls == 67 and conf > phone_threshold:
+                        is_phone = True
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                        cvzone.putTextRect(img, "PHONE DETECTED", (x1, y1 - 10), scale=2, colorR=(0, 255, 255))
 
         self.status = {'sleep': is_sleepy, 'cover': is_face_covered, 'phone': is_phone, 'face': face_visible}
         
@@ -130,18 +115,17 @@ class VideoProcessor(VideoProcessorBase):
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# --- LAYOUT & UI (Non-Blocking) ---
+# --- LAYOUT ---
 col1, col2 = st.columns([2, 1])
 
 with col1:
     st.markdown("### 📹 Live Neural Feed")
-    # Wrapped in a container to look organized
     with st.container(border=True):
-        ctx = webrtc_streamer(key="smart-study-monitor", video_processor_factory=VideoProcessor, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+        # IMPORTANT: Removed custom iceServers to let Streamlit handle TURN/STUN automatically
+        ctx = webrtc_streamer(key="smart-study-monitor", video_processor_factory=VideoProcessor)
 
 with col2:
     st.markdown("### 🟢 Status Dashboard")
-    # Wrapped in a clean container
     with st.container(border=True):
         status_sleep = st.empty()
         status_face = st.empty()
@@ -149,60 +133,62 @@ with col2:
         status_general = st.empty()
         audio_placeholder = st.empty()
 
-# --- NON-BLOCKING UI UPDATE (The "Lag" fix) ---
-# Refresh the UI only once every 1 second, instead of freezing it
-st_autorefresh(interval=1000, key="status_refresh")
-
+# --- STABLE UI UPDATE LOOP (NO AUTOREFRESH, NO CLOSING) ---
 if ctx.video_processor:
     proc = ctx.video_processor
     
-    # 1. Update Status Cards
-    if proc.status['sleep']:
-        status_sleep.markdown('<div class="status-card active-red">😴 SLEEPING</div>', unsafe_allow_html=True)
-    else:
-        status_sleep.markdown('<div class="status-card ok-green">😊 Eyes Open</div>', unsafe_allow_html=True)
+    # Loop to update statuses without reloading the page
+    while True:
+        if proc:
+            # Update Status Cards
+            if proc.status['sleep']:
+                status_sleep.markdown('<div class="status-card active-red">😴 SLEEPING</div>', unsafe_allow_html=True)
+            else:
+                status_sleep.markdown('<div class="status-card ok-green">😊 Eyes Open</div>', unsafe_allow_html=True)
 
-    if proc.status['cover']:
-        status_face.markdown('<div class="status-card active-red">🙈 FACE COVERED</div>', unsafe_allow_html=True)
-    elif not proc.status['face']:
-        status_face.markdown('<div class="status-card warn-yellow">👀 Searching...</div>', unsafe_allow_html=True)
-    else:
-        status_face.markdown('<div class="status-card ok-green">🙂 Face Visible</div>', unsafe_allow_html=True)
+            if proc.status['cover']:
+                status_face.markdown('<div class="status-card active-red">🙈 FACE COVERED</div>', unsafe_allow_html=True)
+            elif not proc.status['face']:
+                status_face.markdown('<div class="status-card warn-yellow">👀 Searching...</div>', unsafe_allow_html=True)
+            else:
+                status_face.markdown('<div class="status-card ok-green">🙂 Face Visible</div>', unsafe_allow_html=True)
 
-    if proc.status['phone']:
-        status_phone.markdown('<div class="status-card active-orange">📱 PHONE DETECTED</div>', unsafe_allow_html=True)
-    else:
-        status_phone.markdown('<div class="status-card ok-green">📵 No Phone</div>', unsafe_allow_html=True)
+            if proc.status['phone']:
+                status_phone.markdown('<div class="status-card active-orange">📱 PHONE DETECTED</div>', unsafe_allow_html=True)
+            else:
+                status_phone.markdown('<div class="status-card ok-green">📵 No Phone</div>', unsafe_allow_html=True)
 
-    # 2. Update Audio (Only reload if state changed, prevents lag & loop glitches)
-    if proc.audio_state == 'sleep':
-        if st.session_state.get("audio_playing") != 'sleep':
-            with open("alarm.mp3", "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
-            st.session_state["audio_playing"] = 'sleep'
-    elif proc.audio_state == 'cover':
-        if st.session_state.get("audio_playing") != 'cover':
-            with open("faudio.mp3", "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
-            st.session_state["audio_playing"] = 'cover'
-    elif proc.audio_state == 'phone':
-        if st.session_state.get("audio_playing") != 'phone':
-            with open("paudio.mp3", "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
-            st.session_state["audio_playing"] = 'phone'
-    else:
-        if st.session_state.get("audio_playing") is not None:
-            audio_placeholder.empty()
-            st.session_state["audio_playing"] = None
+            # Update Audio (Uses session state to avoid reloads)
+            if proc.audio_state == 'sleep':
+                if st.session_state.get("audio_playing") != 'sleep':
+                    with open("alarm.mp3", "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
+                    st.session_state["audio_playing"] = 'sleep'
+            elif proc.audio_state == 'cover':
+                if st.session_state.get("audio_playing") != 'cover':
+                    with open("faudio.mp3", "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
+                    st.session_state["audio_playing"] = 'cover'
+            elif proc.audio_state == 'phone':
+                if st.session_state.get("audio_playing") != 'phone':
+                    with open("paudio.mp3", "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
+                    st.session_state["audio_playing"] = 'phone'
+            else:
+                if st.session_state.get("audio_playing") is not None:
+                    audio_placeholder.empty()
+                    st.session_state["audio_playing"] = None
 
-    status_general.markdown("### ⚡ System Running...")
+            status_general.markdown("### ⚡ System Running...")
+        
+        time.sleep(1) # Updates UI every 1 second, but never closes the page
 else:
     st.info("👈 Press **Start** on the video player to engage the AI.")
 
-# --- FOOTER (Normal flow, no overlap) ---
+# --- FOOTER ---
 st.markdown("""
 <div class="footer">
     Made with ❤️ by <strong>Rohit Dixit</strong> | 
