@@ -39,7 +39,14 @@ with st.sidebar:
     st.markdown("## 🛠️ Settings")
     sleep_threshold = st.slider("Eye Closure Sensitivity", 0.05, 0.5, 0.2, 0.01)
     phone_threshold = st.slider("Phone Detection Confidence", 0.0, 1.0, 0.4, 0.05)
-    st.info("💡 Tap/Click Start to allow camera & audio.")
+    
+    st.markdown("---")
+    # IMPORTANT: Browser Autoplay Policy Fix
+    if st.button("🔊 Click to Enable Alarm Sounds", use_container_width=True):
+        st.session_state["audio_enabled"] = True
+        st.rerun()
+    
+    st.info("💡 Tap Start, then click the 'Enable Alarm Sounds' button to activate looping audio.")
 
 # --- MODELS ---
 @st.cache_resource
@@ -48,7 +55,7 @@ def load_models():
     yolo_model = YOLO("yolov8n.pt")
     return face_detector, yolo_model
 
-# --- SPEED OPTIMIZED VIDEO PROCESSOR ---
+# --- SPEED OPTIMIZED VIDEO PROCESSOR (Now runs YOLO only every 4th frame) ---
 class VideoProcessor(VideoProcessorBase):
     def __init__(self):
         self.face_detector, self.model = load_models()
@@ -60,11 +67,11 @@ class VideoProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="bgr24")
         self.frame_count += 1
 
-        # *** SPEED FIX 1: Process only 1 frame out of every 2 (50% less CPU) ***
+        # *** SPEED FIX 1: Process only 1 frame out of every 2 (FaceMesh) ***
         if self.frame_count % 2 != 0:
             return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        # *** SPEED FIX 2: Downscale image to 320x240 for AI ***
+        # *** SPEED FIX 2: Downscale image to 320x240 ***
         h, w, _ = img.shape
         img_small = cv2.resize(img, (320, 240))
         sx, sy = w / 320, h / 240
@@ -78,7 +85,6 @@ class VideoProcessor(VideoProcessorBase):
         if faces:
             face_visible = True
             face = faces[0]
-            # EAR works identically on smaller images
             def dist(p1, p2):
                 return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
             r_horiz = dist(face[33], face[133])
@@ -90,20 +96,21 @@ class VideoProcessor(VideoProcessorBase):
             ear = (right_ear + left_ear) / 2
             if ear < sleep_threshold: is_sleepy = True
 
-        # 2. Phone Detection (Runs on small image)
-        results = self.model(img_small, stream=True)
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                if cls == 67 and conf > phone_threshold:
-                    is_phone = True
-                    # *** SPEED FIX 3: Map box back to original image coords ***
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    x1, y1, x2, y2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cvzone.putTextRect(img, "PHONE DETECTED", (x1, y1 - 10), scale=2, colorR=(0, 255, 255))
+        # 2. Phone Detection (Runs every 4th frame for SUPER FAST response)
+        if self.frame_count % 4 == 0:
+            results = self.model(img_small, stream=True)
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls == 67 and conf > phone_threshold:
+                        is_phone = True
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        # Map back to original size
+                        x1, y1, x2, y2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                        cvzone.putTextRect(img, "PHONE DETECTED", (x1, y1 - 10), scale=2, colorR=(0, 255, 255))
 
         self.status = {'sleep': is_sleepy, 'cover': False, 'phone': is_phone, 'face': face_visible}
         
@@ -131,13 +138,11 @@ with col2:
         audio_placeholder = st.empty()
 
 # --- THE FIX FOR THE 10-SECOND DELAY AND FREEZING ---
-# Use st.fragment to update every 1 second WITHOUT killing the video connection!
 if ctx.video_processor:
     @st.fragment(run_every=1)
     def update_dashboard():
         proc = ctx.video_processor
         if proc:
-            # Update Status Cards
             if proc.status['sleep']:
                 status_sleep.markdown('<div class="status-card active-red">😴 SLEEPING</div>', unsafe_allow_html=True)
             else:
@@ -155,23 +160,26 @@ if ctx.video_processor:
             else:
                 status_phone.markdown('<div class="status-card ok-green">📵 No Phone</div>', unsafe_allow_html=True)
 
-            # Update Audio (Smooth and non-blocking)
-            if proc.audio_state == 'sleep':
-                if st.session_state.get("audio_playing") != 'sleep':
-                    with open("alarm.mp3", "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode()
-                    audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
-                    st.session_state["audio_playing"] = 'sleep'
-            elif proc.audio_state == 'phone':
-                if st.session_state.get("audio_playing") != 'phone':
-                    with open("paudio.mp3", "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode()
-                    audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
-                    st.session_state["audio_playing"] = 'phone'
-            else:
-                if st.session_state.get("audio_playing") is not None:
-                    audio_placeholder.empty()
-                    st.session_state["audio_playing"] = None
+            # AUDIO LOGIC (Uses the Enable button)
+            audio_enabled = st.session_state.get("audio_enabled", False)
+
+            if audio_enabled:
+                if proc.audio_state == 'sleep':
+                    if st.session_state.get("audio_playing") != 'sleep':
+                        with open("alarm.mp3", "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode()
+                        audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
+                        st.session_state["audio_playing"] = 'sleep'
+                elif proc.audio_state == 'phone':
+                    if st.session_state.get("audio_playing") != 'phone':
+                        with open("paudio.mp3", "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode()
+                        audio_placeholder.markdown(f'<audio autoplay loop><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>', unsafe_allow_html=True)
+                        st.session_state["audio_playing"] = 'phone'
+                else:
+                    if st.session_state.get("audio_playing") is not None:
+                        audio_placeholder.empty()
+                        st.session_state["audio_playing"] = None
 
             status_general.markdown("### ⚡ System Running...")
     update_dashboard()
