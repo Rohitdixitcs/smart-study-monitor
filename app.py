@@ -2,8 +2,9 @@ import streamlit as st
 import cv2
 import cvzone
 import math
-import pygame
+import av
 import time
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 from cvzone.FaceMeshModule import FaceMeshDetector
 from cvzone.HandTrackingModule import HandDetector
 from ultralytics import YOLO
@@ -39,7 +40,17 @@ with st.sidebar:
     st.markdown("## 🛠️ Settings")
     sleep_threshold = st.slider("Eye Closure Sensitivity", 0.05, 0.5, 0.2, 0.01)
     phone_threshold = st.slider("Phone Detection Confidence", 0.0, 1.0, 0.4, 0.05)
-    st.info("💡 Click Start to run locally. Audio plays directly on your PC.")
+    
+    st.markdown("---")
+    # Audio Unlock Button (Crucial for Browsers)
+    if st.button("🔊 Enable Alarm Sounds", use_container_width=True):
+        st.session_state["audio_enabled"] = True
+        st.rerun()
+    
+    if st.session_state.get("audio_enabled"):
+        st.success("✅ Sound Enabled")
+    else:
+        st.warning("⚠️ Click button above to enable sound")
 
 # --- LOAD MODELS ---
 @st.cache_resource
@@ -49,63 +60,32 @@ def load_models():
     yolo_model = YOLO("yolov8n.pt")
     return face_detector, hand_detector, yolo_model
 
-# --- LOCAL AUDIO SETUP ---
-pygame.mixer.init()
-def play_sound_loop(file_path):
-    if not pygame.mixer.music.get_busy():
-        pygame.mixer.music.load(file_path)
-        pygame.mixer.music.play(-1)
+# --- VIDEO PROCESSOR (WebRTC - Smooth 30fps) ---
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.face_detector, self.hand_detector, self.model = load_models()
+        self.status = {'sleep': False, 'cover': False, 'phone': False, 'face': False}
+        self.frame_count = 0
+        self.phone_lock = 0
+        self.cover_lock = 0
 
-def stop_sound():
-    if pygame.mixer.music.get_busy():
-        pygame.mixer.music.stop()
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        self.frame_count += 1
 
-# --- MAIN LOOP ---
-if st.sidebar.button("▶️ START MONITORING"):
-    face_detector, hand_detector, model = load_models()
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.markdown("### 📹 Live Neural Feed")
-        frame_placeholder = st.empty()
-    
-    with col2:
-        st.markdown("### 🟢 Status Dashboard")
-        status_sleep = st.empty()
-        status_face = st.empty()
-        status_phone = st.empty()
-        status_general = st.empty()
-
-    cap = cv2.VideoCapture(0)
-    cap.set(3, 640)
-    cap.set(4, 480)
-
-    current_playing = None
-    frame_count = 0
-    phone_lock_time = 0
-    face_cover_lock_time = 0
-
-    while True:
-        success, img = cap.read()
-        if not success:
-            st.error("Cannot access camera!")
-            break
-
-        frame_count += 1
-
-        # *** FIX: Initialize variables before frame skipping ***
-        faces = []
-        hands = []
-
+        # Resize for faster AI processing
         h, w, _ = img.shape
         img_small = cv2.resize(img, (320, 240))
         sx, sy = w / 320, h / 240
 
-        # 1. Face & Hand Detection (Runs every 2nd frame)
-        if frame_count % 2 == 0:
-            img_small, faces = face_detector.findFaceMesh(img_small, draw=False)
-            hands, _ = hand_detector.findHands(img_small, draw=False)
-        
+        faces = []
+        hands = []
+
+        # Run AI every 2nd frame for smoothness
+        if self.frame_count % 2 == 0:
+            img_small, faces = self.face_detector.findFaceMesh(img_small, draw=False)
+            hands, _ = self.hand_detector.findHands(img_small, draw=False)
+
         is_sleepy = False
         is_face_covered = False
         is_phone = False
@@ -125,81 +105,102 @@ if st.sidebar.button("▶️ START MONITORING"):
             ear = (right_ear + left_ear) / 2
             if ear < sleep_threshold: is_sleepy = True
 
-        # FACE COVER LOGIC
+        # Face Cover Logic
         if not face_visible and hands:
             is_face_covered = True
-            face_cover_lock_time = time.time() + 1.5
-
-        if time.time() < face_cover_lock_time:
+            self.cover_lock = time.time() + 1.5
+        
+        if time.time() < self.cover_lock:
             is_face_covered = True
 
-        # 2. Phone Detection (Runs every 3rd frame)
-        if frame_count % 3 == 0:
-            results = model(img_small, stream=True)
+        # Phone Detection (Runs every 4th frame on a slightly larger image)
+        if self.frame_count % 4 == 0:
+            img_phone = cv2.resize(img, (480, 320))
+            results = self.model(img_phone, stream=True)
             for r in results:
-                boxes = r.boxes
-                for box in boxes:
+                for box in r.boxes:
                     cls = int(box.cls[0])
                     conf = float(box.conf[0])
                     if cls == 67 and conf > phone_threshold:
                         is_phone = True
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        x1, y1, x2, y2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+                        # Scale coordinates back to original size
+                        x1, y1, x2, y2 = int(x1 * (w/480)), int(y1 * (h/320)), int(x2 * (w/480)), int(y2 * (h/320))
                         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
                         cvzone.putTextRect(img, "PHONE DETECTED", (x1, y1 - 10), scale=2, colorR=(0, 255, 255))
-                        phone_lock_time = time.time() + 1.5
-        
-        if time.time() < phone_lock_time:
+                        self.phone_lock = time.time() + 2.0
+
+        if time.time() < self.phone_lock:
             is_phone = True
 
-        # 3. AUDIO LOGIC
-        if is_sleepy:
-            if current_playing != 'sleep':
-                stop_sound()
-                play_sound_loop("alarm.mp3")
-                current_playing = 'sleep'
-        elif is_face_covered:
-            if current_playing != 'face':
-                stop_sound()
-                play_sound_loop("faudio.mp3")
-                current_playing = 'face'
-        elif is_phone:
-            if current_playing != 'phone':
-                stop_sound()
-                play_sound_loop("paudio.mp3")
-                current_playing = 'phone'
-        else:
-            if current_playing is not None:
-                stop_sound()
-                current_playing = None
+        self.status = {'sleep': is_sleepy, 'cover': is_face_covered, 'phone': is_phone, 'face': face_visible}
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        # 4. UPDATE UI
-        frame_placeholder.image(img, channels="BGR", width='stretch')
+# --- LAYOUT ---
+col1, col2 = st.columns([2, 1])
 
-        if is_sleepy:
-            status_sleep.markdown('<div class="status-card active-red">😴 SLEEPING</div>', unsafe_allow_html=True)
-        else:
-            status_sleep.markdown('<div class="status-card ok-green">😊 Eyes Open</div>', unsafe_allow_html=True)
+with col1:
+    st.markdown("### 📹 Live Neural Feed")
+    with st.container(border=True):
+        ctx = webrtc_streamer(key="smart-study-monitor", video_processor_factory=VideoProcessor)
 
-        if is_face_covered:
-            status_face.markdown('<div class="status-card active-red">🙈 FACE COVERED</div>', unsafe_allow_html=True)
-        elif not face_visible:
-            status_face.markdown('<div class="status-card warn-yellow">👀 Searching...</div>', unsafe_allow_html=True)
-        else:
-            status_face.markdown('<div class="status-card ok-green">🙂 Face Visible</div>', unsafe_allow_html=True)
+with col2:
+    st.markdown("### 🟢 Status Dashboard")
+    with st.container(border=True):
+        status_sleep = st.empty()
+        status_face = st.empty()
+        status_phone = st.empty()
+        status_general = st.empty()
+        audio_placeholder = st.empty()
 
-        if is_phone:
-            status_phone.markdown('<div class="status-card active-orange">📱 PHONE DETECTED!</div>', unsafe_allow_html=True)
-        else:
-            status_phone.markdown('<div class="status-card ok-green">📵 No Phone</div>', unsafe_allow_html=True)
+# --- NON-BLOCKING UI UPDATE (Updates every 1 second without freezing video) ---
+if ctx.video_processor:
+    @st.fragment(run_every=1)
+    def update_dashboard():
+        proc = ctx.video_processor
+        if proc:
+            # Update Status Cards
+            if proc.status['sleep']:
+                status_sleep.markdown('<div class="status-card active-red">😴 SLEEPING</div>', unsafe_allow_html=True)
+            else:
+                status_sleep.markdown('<div class="status-card ok-green">😊 Eyes Open</div>', unsafe_allow_html=True)
 
-        status_general.markdown("### ⚡ System Running Locally...")
+            if proc.status['cover']:
+                status_face.markdown('<div class="status-card active-red">🙈 FACE COVERED</div>', unsafe_allow_html=True)
+            elif not proc.status['face']:
+                status_face.markdown('<div class="status-card warn-yellow">👀 Searching...</div>', unsafe_allow_html=True)
+            else:
+                status_face.markdown('<div class="status-card ok-green">🙂 Face Visible</div>', unsafe_allow_html=True)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            if proc.status['phone']:
+                status_phone.markdown('<div class="status-card active-orange">📱 PHONE DETECTED!</div>', unsafe_allow_html=True)
+            else:
+                status_phone.markdown('<div class="status-card ok-green">📵 No Phone</div>', unsafe_allow_html=True)
 
+            # AUDIO LOGIC (Only plays if button was clicked)
+            if st.session_state.get("audio_enabled"):
+                if proc.status['sleep']:
+                    if st.session_state.get("audio_playing") != 'sleep':
+                        audio_placeholder.audio("alarm.mp3", format="audio/mp3", autoplay=True, loop=True)
+                        st.session_state["audio_playing"] = 'sleep'
+                elif proc.status['cover']:
+                    if st.session_state.get("audio_playing") != 'face':
+                        audio_placeholder.audio("faudio.mp3", format="audio/mp3", autoplay=True, loop=True)
+                        st.session_state["audio_playing"] = 'face'
+                elif proc.status['phone']:
+                    if st.session_state.get("audio_playing") != 'phone':
+                        audio_placeholder.audio("paudio.mp3", format="audio/mp3", autoplay=True, loop=True)
+                        st.session_state["audio_playing"] = 'phone'
+                else:
+                    if st.session_state.get("audio_playing") is not None:
+                        audio_placeholder.empty()
+                        st.session_state["audio_playing"] = None
+
+            status_general.markdown("### ⚡ System Running...")
+    
+    update_dashboard()
 else:
-    st.info("👈 Press **START MONITORING** in the sidebar to engage the local AI.")
+    st.info("👈 Press **Start** on the video player, then click **Enable Alarm Sounds** in the sidebar.")
 
 # --- FOOTER ---
 st.markdown("""
