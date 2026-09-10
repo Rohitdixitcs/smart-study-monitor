@@ -41,23 +41,24 @@ with st.sidebar:
     phone_threshold = st.slider("Phone Detection Confidence", 0.0, 1.0, 0.4, 0.05)
     st.info("💡 Click Start to run locally. Audio plays directly on your PC.")
 
-# --- LOAD MODELS (Added HandDetector) ---
+# --- LOAD MODELS ---
 @st.cache_resource
 def load_models():
     face_detector = FaceMeshDetector(maxFaces=1)
-    hand_detector = HandDetector(detectionCon=0.8, maxHands=2) # Detect up to 2 hands
+    hand_detector = HandDetector(detectionCon=0.8, maxHands=2)
     yolo_model = YOLO("yolov8n.pt")
     return face_detector, hand_detector, yolo_model
 
 # --- LOCAL AUDIO SETUP ---
 pygame.mixer.init()
 def play_sound_loop(file_path):
-    pygame.mixer.music.stop()
-    pygame.mixer.music.load(file_path)
-    pygame.mixer.music.play(-1) # -1 loops infinitely
+    if not pygame.mixer.music.get_busy():
+        pygame.mixer.music.load(file_path)
+        pygame.mixer.music.play(-1)
 
 def stop_sound():
-    pygame.mixer.music.stop()
+    if pygame.mixer.music.get_busy():
+        pygame.mixer.music.stop()
 
 # --- MAIN LOOP ---
 if st.sidebar.button("▶️ START MONITORING"):
@@ -82,6 +83,7 @@ if st.sidebar.button("▶️ START MONITORING"):
     current_playing = None
     frame_count = 0
     phone_lock_time = 0
+    face_cover_lock_time = 0
 
     while True:
         success, img = cap.read()
@@ -91,16 +93,19 @@ if st.sidebar.button("▶️ START MONITORING"):
 
         frame_count += 1
 
-        # 1. Face & Hand Detection (Runs every 2nd frame for speed)
-        if frame_count % 2 == 0:
-            img, faces = face_detector.findFaceMesh(img, draw=False)
-            hands, img = hand_detector.findHands(img, draw=False)
-        else:
-            # Keep previous data on skipped frames
-            if frame_count == 1: 
-                faces = []
-                hands = []
+        # *** FIX: Initialize variables before frame skipping ***
+        faces = []
+        hands = []
 
+        h, w, _ = img.shape
+        img_small = cv2.resize(img, (320, 240))
+        sx, sy = w / 320, h / 240
+
+        # 1. Face & Hand Detection (Runs every 2nd frame)
+        if frame_count % 2 == 0:
+            img_small, faces = face_detector.findFaceMesh(img_small, draw=False)
+            hands, _ = hand_detector.findHands(img_small, draw=False)
+        
         is_sleepy = False
         is_face_covered = False
         is_phone = False
@@ -120,14 +125,17 @@ if st.sidebar.button("▶️ START MONITORING"):
             ear = (right_ear + left_ear) / 2
             if ear < sleep_threshold: is_sleepy = True
 
-        # *** FACE COVERED LOGIC (Hand OR Notebook) ***
-        # If no face is visible, but a hand is detected, it means a hand or a notebook is covering it.
+        # FACE COVER LOGIC
         if not face_visible and hands:
             is_face_covered = True
+            face_cover_lock_time = time.time() + 1.5
 
-        # 2. Phone Detection (Every 2nd frame, with LOCK)
-        if frame_count % 2 == 0:
-            results = model(img, stream=True)
+        if time.time() < face_cover_lock_time:
+            is_face_covered = True
+
+        # 2. Phone Detection (Runs every 3rd frame)
+        if frame_count % 3 == 0:
+            results = model(img_small, stream=True)
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
@@ -136,6 +144,7 @@ if st.sidebar.button("▶️ START MONITORING"):
                     if cls == 67 and conf > phone_threshold:
                         is_phone = True
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        x1, y1, x2, y2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
                         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
                         cvzone.putTextRect(img, "PHONE DETECTED", (x1, y1 - 10), scale=2, colorR=(0, 255, 255))
                         phone_lock_time = time.time() + 1.5
@@ -143,17 +152,20 @@ if st.sidebar.button("▶️ START MONITORING"):
         if time.time() < phone_lock_time:
             is_phone = True
 
-        # 3. AUDIO LOGIC (Priority: Sleep > Face Cover > Phone)
+        # 3. AUDIO LOGIC
         if is_sleepy:
             if current_playing != 'sleep':
+                stop_sound()
                 play_sound_loop("alarm.mp3")
                 current_playing = 'sleep'
         elif is_face_covered:
             if current_playing != 'face':
-                play_sound_loop("faudio.mp3") # Plays faudio.mp3
+                stop_sound()
+                play_sound_loop("faudio.mp3")
                 current_playing = 'face'
         elif is_phone:
             if current_playing != 'phone':
+                stop_sound()
                 play_sound_loop("paudio.mp3")
                 current_playing = 'phone'
         else:
